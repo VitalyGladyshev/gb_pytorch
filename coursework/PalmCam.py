@@ -23,6 +23,16 @@ mp_drawing = mp.solutions.drawing_utils
 # For webcam input:
 hands = mp_hands.Hands(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
+IMAGE_WIDTH = 640
+IMAGE_HEIGHT = 480
+
+arm_marks = ['WRIST',
+             'THUMB_CMC', 'THUMB_MCP', 'THUMB_IP', 'THUMB_TIP',
+             'INDEX_FINGER_MCP', 'INDEX_FINGER_PIP', 'INDEX_FINGER_DIP', 'INDEX_FINGER_TIP',
+             'MIDDLE_FINGER_MCP', 'MIDDLE_FINGER_PIP', 'MIDDLE_FINGER_DIP', 'MIDDLE_FINGER_TIP',
+             'RING_FINGER_MCP', 'RING_FINGER_PIP', 'RING_FINGER_DIP', 'RING_FINGER_TIP',
+             'PINKY_MCP', 'PINKY_PIP', 'PINKY_DIP', 'PINKY_TIP']
+
 cam_index_list = []
 for i in range(6):
     cam_tmp = cv2.VideoCapture(i)
@@ -34,8 +44,8 @@ cam = 0
 if cam_index_list:
     cam = cv2.VideoCapture(cam_index_list[0])
     cam.set(cv2.CAP_PROP_FPS, 24)
-    cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cam.set(cv2.CAP_PROP_FRAME_WIDTH, IMAGE_WIDTH)
+    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, IMAGE_HEIGHT)
 
 
 # Класс главного окна приложения
@@ -109,17 +119,18 @@ class MainWindow(QMainWindow):
             self.save_seq += 1
 
     def change_folder(self):
-        path = QFileDialog.getExistingDirectory(self, "Пака для скриншотов", "")
+        path = QFileDialog.getExistingDirectory(self, "Папка для скриншотов", "")
         if path:
             self.save_path = path
             self.save_seq = 0
 
+    # Показываем кадр в окне
     def show_frame_slot(self, frame):
         self.ui.label_for_cam.setPixmap(frame)
 
 
 # Класс детектирования и обработки лица с веб-камеры
-class FaceDetector(QThread):
+class FaceAndHandDetector(QThread):
     frame_update_signal = pyqtSignal(QPixmap)
 
     def __init__(self):
@@ -135,10 +146,13 @@ class FaceDetector(QThread):
         self.timer.timeout.connect(self.fps_count)
         self.timer.start(1000)
 
-    # Функция рисования найденных параметров на кадре
-    def _draw(self, frame, boxes, probs):   # , landmarks
+    # Функция рисования прямоугольника лица
+    def draw_face(self, frame, boxes, probs):   # , landmarks
         try:
+            cnt = 0
             for box, prob in zip(boxes, probs):   # , ld , landmarks
+                cnt += 1
+                print(f"Лицо {cnt} box: {box} prob: {prob:.4f}")
                 # Рисуем обрамляющий прямоугольник лица на кадре
                 cv2.rectangle(frame,
                               (box[0], box[1]),
@@ -148,16 +162,42 @@ class FaceDetector(QThread):
         except Exception as e:
             print('Error in _draw')
             print(f'error : {e}')
-
         return frame
+
+    # Функция рисования прямоугольников рук
+    def draw_hand(self, frame, hand_landmarks):
+        # mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+        max_x = max_y = 0
+        min_x = min_y = 65535
+        for mark in hand_landmarks.landmark:
+            if mark.x > max_x:
+                max_x = mark.x
+            if mark.x < min_x:
+                min_x = mark.x
+            if mark.y > max_y:
+                max_y = mark.y
+            if mark.y < min_y:
+                min_y = mark.y
+        max_x = round(max_x * IMAGE_WIDTH) + 15
+        min_x = round(min_x * IMAGE_WIDTH) - 15
+        max_y = round(max_y * IMAGE_HEIGHT) + 15
+        min_y = round(min_y * IMAGE_HEIGHT) - 15
+        print(f"\tmax_x: {max_x} min_x: {min_x} max_y: {max_y} min_y: {min_y}")
+        # Рисуем обрамляющий прямоугольник руки на кадре
+        cv2.rectangle(frame,
+                      (min_x, min_y),
+                      (max_x, max_y),
+                      (0, 255, 0),
+                      thickness=2)
+        return frame, max_x, min_x, max_y, min_y
 
     def fps_count(self):
         self.prev_frame_counter, self.frame_counter = self.frame_counter, 0
         # self.frame_counter = 0
 
     # Определение наличия рук в кадре
-    def _hand_detection_mp(self, frame):
-        frame = cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB)
+    def hand_detection_mp(self, frame):
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)   # cv2.flip(frame, 1)
         frame.flags.writeable = False
         results = hands.process(frame)
         frame.flags.writeable = True
@@ -166,9 +206,17 @@ class FaceDetector(QThread):
             count = 0
             for hand_landmarks in results.multi_hand_landmarks:
                 count += 1
-                print(f"Рука {count}\n{hand_landmarks}")
+                print(f"Рука {count}")
+                print(
+                    f'\tIndex finger tip coordinates: ('
+                    f'x: {round(hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].x * IMAGE_WIDTH)}, '
+                    f'y: {round(hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].y * IMAGE_HEIGHT)})'
+                )
+                for num, mark in enumerate(hand_landmarks.landmark):
+                    print(f"\tМетка {arm_marks[num]}"
+                          f"- x: {round(mark.x * IMAGE_WIDTH)}, y: {round(mark.y * IMAGE_HEIGHT)}")
 
-        return frame
+        return results
 
     # Функция в которой будет происходить процесс считывания и обработки каждого кадра
     def run(self):
@@ -180,16 +228,16 @@ class FaceDetector(QThread):
                 ret, self.frame = cam.read()
                 try:
                     # детектируем расположение лица на кадре, вероятности на сколько это лицо
-                    # и особенные точки лица
                     boxes, probs = self.mtcnn.detect(self.frame, landmarks=False)   # , landmarks
 
                     if boxes is not None:
-                        print(f"boxes.shape: {boxes.shape} probs: {probs}")
-
                         # Рисуем на кадре
-                        self._draw(self.frame, boxes, probs)   # , landmarks
+                        self.frame = self.draw_face(self.frame, boxes, probs)   # , landmarks
                         # Ищем руки
-                        # self._hand_detection_mp(self.frame)
+                        hand_detect_rez = self.hand_detection_mp(self.frame)
+                        if hand_detect_rez.multi_hand_landmarks:
+                            for hand_landmarks in hand_detect_rez.multi_hand_landmarks:
+                                self.frame, max_x, min_x, max_y, min_y = self.draw_hand(self.frame, hand_landmarks)
 
                 except Exception as e:
                     print(f'Error {e} in run')
@@ -200,7 +248,6 @@ class FaceDetector(QThread):
                             (20, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 1, cv2.LINE_AA)
 
-                # Показываем кадр в окне, и назвываем его(окно) - 'Face Detection'
                 self.frame_counter += 1
                 rgb_image = cv2.cvtColor(self.frame, cv2.COLOR_BGR2RGB)
                 convert_to_qt_format = QImage(rgb_image.data,
@@ -219,8 +266,8 @@ if __name__ == '__main__':
     window = MainWindow()
     window.show()
 
-    face_detect = FaceDetector()
-    face_detect.frame_update_signal.connect(window.show_frame_slot)
-    face_detect.start()
+    face_hand_detect = FaceAndHandDetector()
+    face_hand_detect.frame_update_signal.connect(window.show_frame_slot)
+    face_hand_detect.start()
 
     sys.exit(app.exec_())
