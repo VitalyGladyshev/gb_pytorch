@@ -178,10 +178,10 @@ class FaceAndHandDetector(QThread):
                 max_y = mark.y
             if mark.y < min_y:
                 min_y = mark.y
-        max_x = round(max_x * IMAGE_WIDTH) + 15
-        min_x = round(min_x * IMAGE_WIDTH) - 15
-        max_y = round(max_y * IMAGE_HEIGHT) + 15
-        min_y = round(min_y * IMAGE_HEIGHT) - 15
+        max_x = round(max_x * IMAGE_WIDTH) + 30
+        min_x = round(min_x * IMAGE_WIDTH) - 30
+        max_y = round(max_y * IMAGE_HEIGHT) + 30
+        min_y = round(min_y * IMAGE_HEIGHT) - 30
         print(f"\tmax_x: {max_x} min_x: {min_x} max_y: {max_y} min_y: {min_y}")
         # Рисуем обрамляющий прямоугольник руки на кадре
         cv2.rectangle(frame,
@@ -189,7 +189,7 @@ class FaceAndHandDetector(QThread):
                       (max_x, max_y),
                       (0, 255, 0),
                       thickness=2)
-        return frame, max_x, min_x, max_y, min_y
+        return frame, [min_x, min_y, max_x, max_y]
 
     def fps_count(self):
         self.prev_frame_counter, self.frame_counter = self.frame_counter, 0
@@ -225,7 +225,10 @@ class FaceAndHandDetector(QThread):
             if cam_index_list:
                 # Считываем каждый новый кадр - frame
                 # ret - логическая переменая. Смысл - считали ли мы кадр с потока или нет
+
+                hands = []
                 ret, self.frame = cam.read()
+                self.frame = cv2.flip(self.frame, 1)
                 try:
                     # детектируем расположение лица на кадре, вероятности на сколько это лицо
                     boxes, probs = self.mtcnn.detect(self.frame, landmarks=False)   # , landmarks
@@ -237,7 +240,8 @@ class FaceAndHandDetector(QThread):
                         hand_detect_rez = self.hand_detection_mp(self.frame)
                         if hand_detect_rez.multi_hand_landmarks:
                             for hand_landmarks in hand_detect_rez.multi_hand_landmarks:
-                                self.frame, max_x, min_x, max_y, min_y = self.draw_hand(self.frame, hand_landmarks)
+                                self.frame, hand_box = self.draw_hand(self.frame, hand_landmarks)
+                                hands.append(self.filter_hand(self.frame, hand_box))
 
                 except Exception as e:
                     print(f'Error {e} in run')
@@ -249,14 +253,52 @@ class FaceAndHandDetector(QThread):
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 1, cv2.LINE_AA)
 
                 self.frame_counter += 1
-                rgb_image = cv2.cvtColor(self.frame, cv2.COLOR_BGR2RGB)
-                convert_to_qt_format = QImage(rgb_image.data,
-                                              rgb_image.shape[1],
-                                              rgb_image.shape[0],
-                                              QImage.Format_RGB888)
-                convert_to_qt_format = QPixmap.fromImage(convert_to_qt_format)
-                pixmap = QPixmap(convert_to_qt_format)
-                self.frame_update_signal.emit(pixmap)   # cv2.imshow(self.label, self.frame)
+                self.frame_update_signal.emit(self.frame_to_qpixmap(self.frame))   # cv2.imshow(self.label, self.frame)
+                # if hands:
+                #     self.frame_update_signal.emit(self.frame_to_qpixmap(hands[0]))
+
+    # Функция преобразования врейма в QPixmap
+    def frame_to_qpixmap(self, frame):
+        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        convert_to_qt_format = QImage(rgb_image.data,
+                                      rgb_image.shape[1],
+                                      rgb_image.shape[0],
+                                      QImage.Format_RGB888)
+        convert_to_qt_format = QPixmap.fromImage(convert_to_qt_format)
+        pixmap = QPixmap(convert_to_qt_format)
+        return pixmap
+
+    def filter_hand(self, frame, hand_box):
+        hand_img = frame[int(hand_box[1]):int(hand_box[3]),
+                   int(hand_box[0]):int(hand_box[2])]
+        # hand_img = cv2.resize(hand_img, (48, 48))
+
+        hsv = cv2.cvtColor(hand_img, cv2.COLOR_BGR2HSV)
+
+        # define range of skin color in HSV
+        lower_skin = np.array([0, 20, 70], dtype=np.uint8)
+        upper_skin = np.array([20, 255, 255], dtype=np.uint8)
+
+        # extract skin colur imagw
+        mask = cv2.inRange(hsv, lower_skin, upper_skin)
+
+        # extrapolate the hand to fill dark spots within
+        # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))   #
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.erode(mask, kernel, iterations=2)
+        mask = cv2.dilate(mask, kernel, iterations=2)  # mask = cv2.dilate(mask, kernel, iterations=4)
+
+        # blur the image
+        mask = cv2.GaussianBlur(mask, (3, 3), 0)  # 10
+
+        # mask = cv2.resize(mask, (48, 48))
+        # hand_img = cv2.resize(hand_img, (48, 48))
+        res = cv2.bitwise_and(hand_img, hand_img, mask=mask)
+        res = cv2.resize(res, (48, 48))
+
+        # Превращаем в 1-канальное серое изображение
+        res = cv2.cvtColor(res, cv2.COLOR_BGR2GRAY)
+        return res
 
 
 if __name__ == '__main__':
