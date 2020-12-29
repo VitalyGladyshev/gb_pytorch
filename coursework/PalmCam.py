@@ -12,6 +12,9 @@ import time
 import cv2
 import numpy as np
 import torch
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+
 from facenet_pytorch import MTCNN
 
 import res_img
@@ -33,6 +36,17 @@ arm_marks = ['WRIST',
              'RING_FINGER_MCP', 'RING_FINGER_PIP', 'RING_FINGER_DIP', 'RING_FINGER_TIP',
              'PINKY_MCP', 'PINKY_PIP', 'PINKY_DIP', 'PINKY_TIP']
 
+labels_texts = {0: 'palm',
+                1: 'l',
+                2: 'fist',
+                3: 'fist_moved',
+                4: 'thumb',
+                5: 'index',
+                6: 'ok',
+                7: 'palm_moved',
+                8: 'c',
+                9: 'down'}
+
 cam_index_list = []
 for i in range(6):
     cam_tmp = cv2.VideoCapture(i)
@@ -47,6 +61,108 @@ if cam_index_list:
     cam.set(cv2.CAP_PROP_FRAME_WIDTH, IMAGE_WIDTH)
     cam.set(cv2.CAP_PROP_FRAME_HEIGHT, IMAGE_HEIGHT)
 
+# Класс нейронной сети
+class HPSearchNET(nn.Module):
+
+    def __init__(self,
+                 cnn_num=3,
+                 fc_num=3,
+                 cnn_filt_num=16,
+                 kern_size=3,
+                 func_act='relu',
+                 in_shape=160,
+                 #  batch=64,
+                 nn_prn=False):
+        super(HPSearchNET, self).__init__()
+
+        self.in_size = 1
+        self.cnn_num = cnn_num
+        self.fc_num = fc_num
+        self.cnn_filt_num = cnn_filt_num
+        self.kern_size = kern_size
+        self.func_act = func_act
+        self.fs_size = 0
+        self.in_shape = in_shape
+        # self.batch = batch
+        self.nn_prn = nn_prn
+
+        if kern_size == 3:
+            padd = (1, 1)
+        if kern_size == 5:
+            padd = (2, 2)
+
+        if func_act == 'relu':
+            self.str_f_act = nn.ReLU()
+        else:
+            self.str_f_act = nn.ELU()
+        self.sftmx = nn.Softmax(dim=1)
+
+        self.conv1 = nn.Conv2d(self.in_size,
+                               self.cnn_filt_num,
+                               kernel_size=self.kern_size,
+                               stride=1,
+                               padding=padd)
+        self.pool = nn.MaxPool2d(2, 2)
+        if self.cnn_num > 1:
+            self.conv2 = nn.Conv2d(self.cnn_filt_num,
+                                   self.cnn_filt_num * 2,
+                                   kernel_size=self.kern_size,
+                                   stride=1,
+                                   padding=padd)
+            self.cnn_filt_num *= 2
+            if self.cnn_num > 2:
+                self.conv3 = nn.Conv2d(self.cnn_filt_num,
+                                       self.cnn_filt_num * 2,
+                                       kernel_size=self.kern_size,
+                                       stride=1,
+                                       padding=padd)
+                self.cnn_filt_num *= 2
+
+        self.fs_size = self.cnn_filt_num * (self.in_shape // 2 ** self.cnn_num) ** 2
+        fs_sz = self.fs_size
+
+        if self.fc_num > 2:
+            self.fc_dec2 = nn.Linear(fs_sz, fs_sz // 4)  # fs_sz*3//4
+            fs_sz = fs_sz // 4  # *3//4
+        if self.fc_num > 1:
+            self.fc_dec1 = nn.Linear(fs_sz, fs_sz // 4)  # fs_sz*3//4
+            fs_sz = fs_sz // 4  # *3//4
+        self.fc_out = nn.Linear(fs_sz, 10)
+
+    def forward(self, x):
+        if self.nn_prn:
+            if self.func_act == 'relu':
+                print("\n\tФункции активации ReLU")
+            else:
+                print("\n\tФункции активации ELU")
+            print("\n\tX размеры income: %s" % (x.shape,))
+        x = self.pool(self.str_f_act(self.conv1(x)))
+        if self.nn_prn:
+            print("\tX размеры conv1, pool: %s" % (x.shape,))
+        if self.cnn_num > 1:
+            x = self.pool(self.str_f_act(self.conv2(x)))
+            if self.nn_prn:
+                print("\tX размеры conv2, pool: %s" % (x.shape,))
+            if self.cnn_num > 2:
+                x = self.pool(self.str_f_act(self.conv3(x)))
+                if self.nn_prn:
+                    print("\tX размеры conv3, pool: %s" % (x.shape,))
+        x = x.view(-1, self.fs_size)
+        if self.nn_prn:
+            print("\tX размеры x.view: %s" % (x.shape,))
+        if self.fc_num > 2:
+            x = self.str_f_act(self.fc_dec2(x))
+            if self.nn_prn:
+                print("\tX размеры fc_dec2: %s" % (x.shape,))
+        if self.fc_num > 1:
+            x = self.str_f_act(self.fc_dec1(x))
+            if self.nn_prn:
+                print("\tX размеры fc_dec1: %s" % (x.shape,))
+        x = self.sftmx(self.fc_out(x))
+        if self.nn_prn:
+            print("\tX размеры fc_out: %s\n" % (x.shape,))
+            self.nn_prn = False
+        return x
 
 # Класс главного окна приложения
 class MainWindow(QMainWindow):
@@ -146,6 +262,15 @@ class FaceAndHandDetector(QThread):
         self.timer.timeout.connect(self.fps_count)
         self.timer.start(1000)
 
+        self.model = HPSearchNET(cnn_num=3,
+                                 fc_num=2,
+                                 kern_size=3,
+                                 func_act='elu',
+                                 nn_prn=True,
+                                 in_shape=160).to(self.device)
+        self.model.load_state_dict(torch.load("hnd_net_elu_cnn3_fc2_kr3.pth", map_location=self.device))
+        self.model.eval()
+
     # Функция рисования прямоугольника лица
     def draw_face(self, frame, boxes, probs):   # , landmarks
         try:
@@ -182,6 +307,14 @@ class FaceAndHandDetector(QThread):
         min_x = round(min_x * IMAGE_WIDTH) - 30
         max_y = round(max_y * IMAGE_HEIGHT) + 30
         min_y = round(min_y * IMAGE_HEIGHT) - 30
+        if min_x < 0:
+            min_x = 0
+        if min_y < 0:
+            min_y = 0
+        if max_x > IMAGE_WIDTH:
+            max_x = IMAGE_WIDTH
+        if max_y > IMAGE_HEIGHT:
+            max_y = IMAGE_HEIGHT
         print(f"\tmax_x: {max_x} min_x: {min_x} max_y: {max_y} min_y: {min_y}")
         # Рисуем обрамляющий прямоугольник руки на кадре
         cv2.rectangle(frame,
@@ -242,6 +375,19 @@ class FaceAndHandDetector(QThread):
                             for hand_landmarks in hand_detect_rez.multi_hand_landmarks:
                                 self.frame, hand_box = self.draw_hand(self.frame, hand_landmarks)
                                 hands.append(self.filter_hand(self.frame, hand_box))
+                                # размер 160х160
+                                # Нормализуем изображение в значениях [0, 1]
+                                img = torch.from_numpy(hands[-1]) / 255
+                                img = img.unsqueeze(0).unsqueeze(0)
+                                with torch.no_grad():
+                                    outputs = self.model(img.to(self.device))
+                                    _, predicted = torch.max(outputs.data, 1)
+                                    print(f"predicted: {labels_texts[int(predicted)]}")
+                                    # пишем на кадре какая эмоция распознана
+                                    cv2.putText(self.frame,
+                                                labels_texts[int(predicted)],
+                                                (hand_box[2], hand_box[3]),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
 
                 except Exception as e:
                     print(f'Error {e} in run')
@@ -270,7 +416,7 @@ class FaceAndHandDetector(QThread):
 
     def filter_hand(self, frame, hand_box):
         hand_img = frame[int(hand_box[1]):int(hand_box[3]),
-                   int(hand_box[0]):int(hand_box[2])]
+                         int(hand_box[0]):int(hand_box[2])]
         # hand_img = cv2.resize(hand_img, (48, 48))
 
         hsv = cv2.cvtColor(hand_img, cv2.COLOR_BGR2HSV)
@@ -294,7 +440,7 @@ class FaceAndHandDetector(QThread):
         # mask = cv2.resize(mask, (48, 48))
         # hand_img = cv2.resize(hand_img, (48, 48))
         res = cv2.bitwise_and(hand_img, hand_img, mask=mask)
-        res = cv2.resize(res, (48, 48))
+        res = cv2.resize(res, (160, 160))
 
         # Превращаем в 1-канальное серое изображение
         res = cv2.cvtColor(res, cv2.COLOR_BGR2GRAY)
