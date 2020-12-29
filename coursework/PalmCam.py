@@ -383,7 +383,7 @@ class FaceAndHandDetector(QThread):
                                     outputs = self.model(img.to(self.device))
                                     _, predicted = torch.max(outputs.data, 1)
                                     print(f"predicted: {labels_texts[int(predicted)]}")
-                                    # пишем на кадре какая эмоция распознана
+                                    # пишем в кадре какой жест
                                     cv2.putText(self.frame,
                                                 labels_texts[int(predicted)],
                                                 (hand_box[2], hand_box[3]),
